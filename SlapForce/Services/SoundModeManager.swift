@@ -53,6 +53,58 @@ enum IntensityTier: Int, CaseIterable, Identifiable {
     var suffix: String { "\(displayName)档" }
 }
 
+private enum SexySourceLayer: Int, CaseIterable {
+    case 克制 = 1
+    case 轻柔 = 2
+    case 贴近 = 3
+    case 投入 = 4
+    case 炽热 = 5
+
+    var displayName: String {
+        switch self {
+        case .克制: return "克制"
+        case .轻柔: return "轻柔"
+        case .贴近: return "贴近"
+        case .投入: return "投入"
+        case .炽热: return "炽热"
+        }
+    }
+
+    var indexRange: ClosedRange<Int> {
+        switch self {
+        case .克制: return 1...10
+        case .轻柔: return 11...21
+        case .贴近: return 22...33
+        case .投入: return 34...46
+        case .炽热: return 47...59
+        }
+    }
+
+    static func forOrderedIndex(_ index: Int) -> SexySourceLayer {
+        switch index {
+        case 1...10: return .克制
+        case 11...21: return .轻柔
+        case 22...33: return .贴近
+        case 34...46: return .投入
+        default: return .炽热
+        }
+    }
+
+    static func baseLayer(for momentum: Double) -> SexySourceLayer {
+        switch momentum {
+        case ..<0.30: return .克制
+        case ..<0.56: return .轻柔
+        case ..<0.78: return .贴近
+        case ..<0.93: return .投入
+        default: return .炽热
+        }
+    }
+
+    static func clamped(_ rawValue: Int) -> SexySourceLayer {
+        SexySourceLayer(rawValue: min(max(rawValue, 1), 5)) ?? .克制
+    }
+}
+
 struct SoundModeConfig {
     // 模式基础音量。normalizedMagnitude 为 0 时，播放从这里起步。
     let baseVolume: Float
@@ -83,6 +135,8 @@ private struct DerivedClipVariant {
     let displayName: String
     let sourceIntensity: Double
     let sourceMood: Double
+    let sourceOrderedIndex: Int?
+    let sexyLayer: SexySourceLayer?
     let buffer: AVAudioPCMBuffer
 }
 
@@ -93,6 +147,8 @@ private struct SourceClipDescriptor {
     let rawIntensity: Double
     let normalizedIntensity: Double
     let normalizedMood: Double
+    let orderedIndex: Int?
+    let sexyLayer: SexySourceLayer?
 }
 
 private struct ModePlaybackPool {
@@ -136,6 +192,129 @@ private struct VariantRenderProfile {
     let eqFrequencyOffset: Float
 }
 
+private struct PlaybackEQSettings {
+    let frequency: Float
+    let gain: Float
+    let bandwidth: Float
+}
+
+private struct PlaybackRequest {
+    let buffer: AVAudioPCMBuffer
+    let volume: Float
+    let pitch: Float
+    let eq: PlaybackEQSettings
+}
+
+private final class PlaybackCoordinator {
+    private final class PlayerSlot {
+        let player = AVAudioPlayerNode()
+        let pitch = AVAudioUnitTimePitch()
+        let eq = AVAudioUnitEQ(numberOfBands: 1)
+        var busyUntil: TimeInterval = 0
+        var lastUsedAt: TimeInterval = 0
+    }
+
+    private let engine = AVAudioEngine()
+    private let queue = DispatchQueue(label: "SlapForce.AudioPlayback", qos: .userInitiated)
+    private let format: AVAudioFormat
+    private var slots: [PlayerSlot] = []
+
+    init(format: AVAudioFormat, slotCount: Int = 4) {
+        self.format = format
+        configure(slotCount: slotCount)
+    }
+
+    func warmUp() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            try? self.ensureEngineRunning()
+        }
+    }
+
+    func recoverIfNeeded() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if !self.engine.isRunning {
+                try? self.ensureEngineRunning()
+            }
+        }
+    }
+
+    func play(_ request: PlaybackRequest, completion: @escaping @Sendable (NSError?) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.ensureEngineRunning()
+                let now = ProcessInfo.processInfo.systemUptime
+                let slot = self.selectSlot(now: now)
+
+                slot.player.stop()
+                slot.player.volume = request.volume
+                slot.pitch.pitch = request.pitch
+
+                let band = slot.eq.bands[0]
+                band.filterType = .parametric
+                band.bypass = false
+                band.frequency = request.eq.frequency
+                band.gain = request.eq.gain
+                band.bandwidth = request.eq.bandwidth
+
+                slot.lastUsedAt = now
+                slot.busyUntil = now + Double(request.buffer.frameLength) / self.format.sampleRate + 0.05
+                slot.player.scheduleBuffer(request.buffer, at: nil, options: .interrupts, completionHandler: nil)
+                slot.player.play()
+                completion(nil)
+            } catch {
+                self.recoverEngine()
+                completion(error as NSError)
+            }
+        }
+    }
+
+    private func configure(slotCount: Int) {
+        for _ in 0..<slotCount {
+            let slot = PlayerSlot()
+            let band = slot.eq.bands[0]
+            band.filterType = .parametric
+            band.bypass = false
+            band.frequency = 1_800
+            band.bandwidth = 1.2
+            band.gain = 0
+
+            engine.attach(slot.player)
+            engine.attach(slot.pitch)
+            engine.attach(slot.eq)
+            engine.connect(slot.player, to: slot.pitch, format: format)
+            engine.connect(slot.pitch, to: slot.eq, format: format)
+            engine.connect(slot.eq, to: engine.mainMixerNode, format: format)
+            slots.append(slot)
+        }
+
+        engine.mainMixerNode.outputVolume = 1.0
+        engine.prepare()
+    }
+
+    private func ensureEngineRunning() throws {
+        if !engine.isRunning {
+            try engine.start()
+        }
+    }
+
+    private func recoverEngine() {
+        engine.stop()
+        engine.reset()
+        engine.prepare()
+        try? engine.start()
+    }
+
+    private func selectSlot(now: TimeInterval) -> PlayerSlot {
+        if let available = slots.first(where: { $0.busyUntil <= now }) {
+            return available
+        }
+        return slots.min(by: { $0.lastUsedAt < $1.lastUsedAt }) ?? slots[0]
+    }
+}
+
 @MainActor
 final class SoundModeManager: ObservableObject {
     @Published var currentMode: SoundMode {
@@ -157,7 +336,13 @@ final class SoundModeManager: ObservableObject {
     @Published private(set) var sexyStateLabel = "冷静"
     @Published private(set) var sexyStateValue: Double = 0
     @Published private(set) var sexySourceLayerLabel = "-"
-    @Published private(set) var sexyLibraryLayerSummary = "轻柔0 / 贴近0 / 炽热0"
+    @Published private(set) var sexyBaseLayerLabel = "-"
+    @Published private(set) var sexyImpactBoostLabel = "0"
+    @Published private(set) var sexyFinalLayerLabel = "-"
+    @Published private(set) var sexySelectionWindowLabel = "-"
+    @Published private(set) var sexyLibraryLayerSummary = "克制0 / 轻柔0 / 贴近0 / 投入0 / 炽热0"
+    @Published private(set) var currentSourceLayerLabel = "-"
+    @Published private(set) var currentSelectionWindowLabel = "-"
 
     @Published var editableBaseVolume: Double = 0.6 {
         didSet { applyEditorChanges() }
@@ -178,12 +363,9 @@ final class SoundModeManager: ObservableObject {
         }
     }
 
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
-    private let timePitch = AVAudioUnitTimePitch()
-    private let eq = AVAudioUnitEQ(numberOfBands: 1)
     private let playbackFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
     private let fileManager = FileManager.default
+    private lazy var playbackCoordinator = PlaybackCoordinator(format: playbackFormat, slotCount: 4)
 
     private let maxExpectedMagnitude: Double = 1.6
     private var playbackCooldown: TimeInterval = 0.08
@@ -196,7 +378,8 @@ final class SoundModeManager: ObservableObject {
     private var sexyMomentum: Double = 0
     private var lastSexyMomentumUpdate: TimeInterval = 0
     private var lastSexyHitTime: TimeInterval = 0
-    private let sexyDecayHalfLife: TimeInterval = 24
+    private let sexyDecayHalfLife: TimeInterval = 14
+    private let sexyIdleResetAfter: TimeInterval = 6.5
 
     init() {
         if let raw = UserDefaults.standard.string(forKey: Keys.currentMode),
@@ -210,7 +393,6 @@ final class SoundModeManager: ObservableObject {
         editablePlaybackCooldown = min(max(storedCooldown ?? 0.08, 0.02), 0.40)
         playbackCooldown = editablePlaybackCooldown
 
-        configureEngine()
         rebuildLibrary()
         syncEditorsFromCurrentMode()
         warmUpEngine()
@@ -249,63 +431,66 @@ final class SoundModeManager: ObservableObject {
             let volume = clampedVolume(baseVolume * profile.volumeMultiplier)
             let pitch = mappedPitch(normalizedMagnitude: normalizedMagnitude, range: config.pitchRange) + profile.pitchOffset
 
-            do {
-                try ensureEngineRunning()
+            let eq = eqSettings(
+                for: mode,
+                tier: tier,
+                normalizedMagnitude: normalizedMagnitude,
+                profile: profile,
+                sexyMomentum: sexyState
+            )
 
-                timePitch.pitch = pitch
-                player.volume = volume
-                applyEQ(
+            let request: PlaybackRequest
+            if let variant = selectVariant(
+                mode: mode,
+                tier: tier,
+                normalizedMagnitude: normalizedMagnitude,
+                sexyMomentum: sexyState
+            ) {
+                request = PlaybackRequest(buffer: variant.buffer, volume: volume, pitch: pitch, eq: eq)
+                lastPlayedVariantIDByMode[mode] = variant.id
+                lastSourceClipName = variant.sourceName
+                lastVariantName = variant.displayName
+                lastClipName = variant.displayName
+                lastTriggerTierName = tier.displayName
+                currentSourceLayerLabel = variant.sexyLayer?.displayName ?? currentSourceLayerLabel
+                currentSelectionWindowLabel = currentSelectionWindowLabel == "-" ? sexyWindowLabel(for: [variant]) : currentSelectionWindowLabel
+                sexySourceLayerLabel = mode == .性感 ? currentSourceLayerLabel : "-"
+                playbackStatus = mode == .性感
+                    ? "\(mode.displayName)模式 \(tier.suffix)：\(variant.sourceName) · 状态\(sexyStateLabel) · 素材\(sexySourceLayerLabel)"
+                    : "\(mode.displayName)模式 \(tier.suffix)：\(variant.sourceName) · 层级\(currentSourceLayerLabel)"
+            } else {
+                let fallback = makeFallbackBuffer(
                     for: mode,
-                    tier: tier,
                     normalizedMagnitude: normalizedMagnitude,
-                    profile: profile,
                     sexyMomentum: sexyState
                 )
-
-                if let variant = selectVariant(
-                    mode: mode,
-                    tier: tier,
-                    normalizedMagnitude: normalizedMagnitude,
-                    sexyMomentum: sexyState
-                ) {
-                    player.scheduleBuffer(variant.buffer, at: nil, options: .interrupts, completionHandler: nil)
-                    player.play()
-                    lastPlayedVariantIDByMode[mode] = variant.id
-                    lastSourceClipName = variant.sourceName
-                    lastVariantName = variant.displayName
-                    lastClipName = variant.displayName
-                    lastTriggerTierName = tier.displayName
-                    sexySourceLayerLabel = mode == .性感 ? sexyMoodLabel(for: variant.sourceMood) : "-"
-                    playbackStatus = mode == .性感
-                        ? "\(mode.displayName)模式 \(tier.suffix)：\(variant.sourceName) · 状态\(sexyStateLabel) · 素材\(sexySourceLayerLabel)"
-                        : "\(mode.displayName)模式 \(tier.suffix)：\(variant.sourceName)"
-                } else {
-                    let fallback = makeFallbackBuffer(
-                        for: mode,
-                        normalizedMagnitude: normalizedMagnitude,
-                        sexyMomentum: sexyState
-                    )
-                    player.scheduleBuffer(fallback, at: nil, options: .interrupts, completionHandler: nil)
-                    player.play()
-                    lastSourceClipName = "无导入片段"
-                    lastVariantName = "\(mode.displayName)合成回退"
-                    lastClipName = lastVariantName
-                    lastTriggerTierName = tier.displayName
-                    sexySourceLayerLabel = mode == .性感 ? "回退音" : "-"
-                    playbackStatus = mode == .性感
-                        ? "\(mode.displayName)模式暂无可用音频，当前使用状态化回退音 · \(sexyStateLabel)"
-                        : "\(mode.displayName)模式暂无可用音频，当前使用回退音"
-                }
-
-                lastVolume = volume
-                lastPitch = pitch
-            } catch {
-                let nsError = error as NSError
-                lastClipName = "播放错误"
-                lastSourceClipName = "播放错误"
-                lastVariantName = "播放错误"
+                request = PlaybackRequest(buffer: fallback, volume: volume, pitch: pitch, eq: eq)
+                lastSourceClipName = "无导入片段"
+                lastVariantName = "\(mode.displayName)合成回退"
+                lastClipName = lastVariantName
                 lastTriggerTierName = tier.displayName
-                playbackStatus = "模式播放错误 [\(nsError.domain):\(nsError.code)] \(nsError.localizedDescription)"
+                currentSourceLayerLabel = "-"
+                currentSelectionWindowLabel = "-"
+                sexySourceLayerLabel = mode == .性感 ? "回退音" : "-"
+                playbackStatus = mode == .性感
+                    ? "\(mode.displayName)模式暂无可用音频，当前使用状态化回退音 · \(sexyStateLabel)"
+                    : "\(mode.displayName)模式暂无可用音频，当前使用回退音"
+            }
+
+            playbackCoordinator.play(request) { [weak self] error in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if let error {
+                        self.lastClipName = "播放错误"
+                        self.lastSourceClipName = "播放错误"
+                        self.lastVariantName = "播放错误"
+                        self.lastTriggerTierName = tier.displayName
+                        self.playbackStatus = "模式播放错误 [\(error.domain):\(error.code)] \(error.localizedDescription)"
+                    } else {
+                        self.lastVolume = volume
+                        self.lastPitch = pitch
+                    }
+                }
             }
         }
     }
@@ -351,34 +536,8 @@ final class SoundModeManager: ObservableObject {
         return "基础音量 \(String(format: "%.2f", config.baseVolume))  音调 \(Int(config.pitchRange.lowerBound))...\(Int(config.pitchRange.upperBound))  力度增益 \(String(format: "%.2f", config.intensityScale))  派生 \(poolSummary)"
     }
 
-    private func configureEngine() {
-        let band = eq.bands[0]
-        band.filterType = .parametric
-        band.bypass = false
-        band.frequency = 1_800
-        band.bandwidth = 1.2
-        band.gain = 0
-
-        engine.attach(player)
-        engine.attach(timePitch)
-        engine.attach(eq)
-        engine.connect(player, to: timePitch, format: playbackFormat)
-        engine.connect(timePitch, to: eq, format: playbackFormat)
-        engine.connect(eq, to: engine.mainMixerNode, format: playbackFormat)
-        engine.mainMixerNode.outputVolume = 1.0
-        engine.prepare()
-    }
-
     private func warmUpEngine() {
-        Task { @MainActor in
-            try? ensureEngineRunning()
-        }
-    }
-
-    private func ensureEngineRunning() throws {
-        if !engine.isRunning {
-            try engine.start()
-        }
+        playbackCoordinator.warmUp()
     }
 
     private func scanSoundFiles() -> [URL] {
@@ -484,7 +643,7 @@ final class SoundModeManager: ObservableObject {
 
         for mode in SoundMode.allCases {
             var pool = ModePlaybackPool()
-            let descriptors = buildSourceDescriptors(for: grouped[mode] ?? [])
+            let descriptors = buildSourceDescriptors(for: grouped[mode] ?? [], mode: mode)
             for descriptor in descriptors {
                 do {
                     for tier in IntensityTier.allCases {
@@ -494,6 +653,8 @@ final class SoundModeManager: ObservableObject {
                             sourceName: descriptor.sourceName,
                             sourceIntensity: descriptor.normalizedIntensity,
                             sourceMood: descriptor.normalizedMood,
+                            sourceOrderedIndex: descriptor.orderedIndex,
+                            sexyLayer: descriptor.sexyLayer,
                             mode: mode,
                             tier: tier
                         )
@@ -516,7 +677,7 @@ final class SoundModeManager: ObservableObject {
         return result
     }
 
-    private func buildSourceDescriptors(for urls: [URL]) -> [SourceClipDescriptor] {
+    private func buildSourceDescriptors(for urls: [URL], mode: SoundMode) -> [SourceClipDescriptor] {
         var rawDescriptors: [(url: URL, name: String, buffer: AVAudioPCMBuffer, rawIntensity: Double)] = []
 
         for url in urls {
@@ -546,6 +707,49 @@ final class SoundModeManager: ObservableObject {
         let maxScore = sorted.last?.rawIntensity ?? 1
         let span = max(maxScore - minScore, 0.0001)
 
+        let orderedDescriptors = rawDescriptors.compactMap { descriptor -> (descriptor: (url: URL, name: String, buffer: AVAudioPCMBuffer, rawIntensity: Double), index: Int)? in
+            guard let index = orderedIndex(from: descriptor.name, mode: mode) else { return nil }
+            return (descriptor, index)
+        }
+
+        if !orderedDescriptors.isEmpty {
+            let ordered = orderedDescriptors.sorted { left, right in
+                let leftIndex = left.index
+                let rightIndex = right.index
+                switch (leftIndex, rightIndex) {
+                default:
+                    if leftIndex == rightIndex {
+                        return left.descriptor.name < right.descriptor.name
+                    }
+                    return leftIndex < rightIndex
+                }
+            }
+
+            return ordered.enumerated().map { index, descriptor in
+                let orderedIndex = descriptor.index
+                let sequencePosition = ordered.count == 1 ? 0.5 : Double(index) / Double(ordered.count - 1)
+                let normalized: Double
+                let layer: SexySourceLayer
+                if mode == .性感 {
+                    normalized = max(0, Double(orderedIndex - 1) / 58.0)
+                    layer = SexySourceLayer.forOrderedIndex(orderedIndex)
+                } else {
+                    normalized = sequencePosition
+                    layer = orderedLayerForSequencePosition(index: index, totalCount: ordered.count)
+                }
+                return SourceClipDescriptor(
+                    url: descriptor.descriptor.url,
+                    sourceName: descriptor.descriptor.name,
+                    buffer: descriptor.descriptor.buffer,
+                    rawIntensity: descriptor.descriptor.rawIntensity,
+                    normalizedIntensity: normalized,
+                    normalizedMood: normalized,
+                    orderedIndex: orderedIndex,
+                    sexyLayer: layer
+                )
+            }
+        }
+
         return sorted.enumerated().map { index, descriptor in
             let rankPosition = sorted.count == 1 ? 0.5 : Double(index) / Double(sorted.count - 1)
             let normalizedByFeature = (descriptor.rawIntensity - minScore) / span
@@ -558,7 +762,9 @@ final class SoundModeManager: ObservableObject {
                 buffer: descriptor.buffer,
                 rawIntensity: descriptor.rawIntensity,
                 normalizedIntensity: normalized,
-                normalizedMood: normalizedMood
+                normalizedMood: normalizedMood,
+                orderedIndex: nil,
+                sexyLayer: nil
             )
         }
     }
@@ -586,6 +792,8 @@ final class SoundModeManager: ObservableObject {
         sourceName: String,
         sourceIntensity: Double,
         sourceMood: Double,
+        sourceOrderedIndex: Int?,
+        sexyLayer: SexySourceLayer?,
         mode: SoundMode,
         tier: IntensityTier
     ) throws -> DerivedClipVariant {
@@ -680,6 +888,8 @@ final class SoundModeManager: ObservableObject {
             displayName: variantName,
             sourceIntensity: sourceIntensity,
             sourceMood: sourceMood,
+            sourceOrderedIndex: sourceOrderedIndex,
+            sexyLayer: sexyLayer,
             buffer: output
         )
     }
@@ -877,6 +1087,36 @@ final class SoundModeManager: ObservableObject {
         normalizedMagnitude: Double,
         sexyMomentum: Double = 0
     ) -> DerivedClipVariant? {
+        if let variant = selectOrderedVariant(
+            mode: mode,
+            tier: tier,
+            normalizedMagnitude: normalizedMagnitude,
+            sexyMomentum: sexyMomentum
+        ) {
+            return variant
+        }
+
+        sexyBaseLayerLabel = "-"
+        sexyImpactBoostLabel = "0"
+        sexyFinalLayerLabel = "-"
+        sexySelectionWindowLabel = "-"
+        currentSourceLayerLabel = "-"
+        currentSelectionWindowLabel = "-"
+
+        return selectGeneralVariant(
+            mode: mode,
+            tier: tier,
+            normalizedMagnitude: normalizedMagnitude,
+            sexyMomentum: sexyMomentum
+        )
+    }
+
+    private func selectGeneralVariant(
+        mode: SoundMode,
+        tier: IntensityTier,
+        normalizedMagnitude: Double,
+        sexyMomentum: Double = 0
+    ) -> DerivedClipVariant? {
         guard let pool = playbackPools[mode], !pool.isEmpty else { return nil }
 
         let selectedTier = effectiveTier(for: mode, baseTier: tier, sexyMomentum: sexyMomentum)
@@ -922,6 +1162,182 @@ final class SoundModeManager: ObservableObject {
         let shortlistCount = min(max(1, Int(ceil(Double(sortedCandidates.count) * 0.5))), 3)
         let shortlist = Array(sortedCandidates.prefix(shortlistCount))
         return shortlist.randomElement() ?? sortedCandidates.first
+    }
+
+    private func selectOrderedVariant(
+        mode: SoundMode,
+        tier: IntensityTier,
+        normalizedMagnitude: Double,
+        sexyMomentum: Double
+    ) -> DerivedClipVariant? {
+        guard let pool = playbackPools[mode], !pool.isEmpty else { return nil }
+
+        var candidates = pool.variants(for: tier)
+        if candidates.isEmpty {
+            candidates = pool.allVariants
+        }
+
+        let orderedCandidates = candidates
+            .filter { $0.sourceOrderedIndex != nil && $0.sexyLayer != nil }
+            .sorted { ($0.sourceOrderedIndex ?? 0) < ($1.sourceOrderedIndex ?? 0) }
+
+        guard !orderedCandidates.isEmpty else { return nil }
+
+        let baseLayer: SexySourceLayer
+        let impactBoost: Int
+        var finalLayer: SexySourceLayer
+
+        if mode == .性感 {
+            baseLayer = SexySourceLayer.baseLayer(for: sexyMomentum)
+            impactBoost = sexyImpactBoost(for: normalizedMagnitude)
+            finalLayer = SexySourceLayer.clamped(baseLayer.rawValue + impactBoost)
+
+            if normalizedMagnitude >= 0.92 {
+                finalLayer = SexySourceLayer.clamped(max(finalLayer.rawValue, SexySourceLayer.投入.rawValue))
+            }
+            if normalizedMagnitude >= 0.985 {
+                finalLayer = .炽热
+            }
+        } else {
+            baseLayer = orderedBaseLayer(for: normalizedMagnitude)
+            impactBoost = 0
+            finalLayer = baseLayer
+        }
+
+        var layerCandidates = orderedCandidates.filter { $0.sexyLayer == finalLayer }
+        if layerCandidates.isEmpty {
+            layerCandidates = nearestSexyLayerCandidates(
+                from: orderedCandidates,
+                targetLayer: finalLayer
+            )
+        }
+        guard !layerCandidates.isEmpty else { return nil }
+
+        if let lastID = lastPlayedVariantIDByMode[mode], layerCandidates.count > 1 {
+            let filtered = layerCandidates.filter { $0.id != lastID }
+            if !filtered.isEmpty {
+                layerCandidates = filtered
+            }
+        }
+
+        let windowBias = mode == .性感
+            ? sexyWindowBias(
+                normalizedMagnitude: normalizedMagnitude,
+                sexyMomentum: sexyMomentum,
+                impactBoost: impactBoost
+            )
+            : orderedWindowBias(for: normalizedMagnitude)
+        let shortlist = sexyWindowedShortlist(from: layerCandidates, bias: windowBias)
+        let chosen = shortlist.randomElement() ?? layerCandidates.first
+
+        currentSourceLayerLabel = chosen?.sexyLayer?.displayName ?? finalLayer.displayName
+        currentSelectionWindowLabel = sexyWindowLabel(for: shortlist.isEmpty ? layerCandidates : shortlist)
+
+        if mode == .性感 {
+            sexyBaseLayerLabel = baseLayer.displayName
+            sexyImpactBoostLabel = impactBoost >= 0 ? "+\(impactBoost)" : "\(impactBoost)"
+            sexyFinalLayerLabel = finalLayer.displayName
+            sexySourceLayerLabel = currentSourceLayerLabel
+            sexySelectionWindowLabel = currentSelectionWindowLabel
+        }
+
+        return chosen
+    }
+
+    private func orderedBaseLayer(for normalizedMagnitude: Double) -> SexySourceLayer {
+        switch normalizedMagnitude {
+        case ..<0.16: return .克制
+        case ..<0.36: return .轻柔
+        case ..<0.60: return .贴近
+        case ..<0.82: return .投入
+        default: return .炽热
+        }
+    }
+
+    private func orderedWindowBias(for normalizedMagnitude: Double) -> Double {
+        switch normalizedMagnitude {
+        case ..<0.18: return 0.16
+        case ..<0.38: return 0.30
+        case ..<0.62: return 0.48
+        case ..<0.82: return 0.66
+        default: return 0.84
+        }
+    }
+
+    private func orderedLayerForSequencePosition(index: Int, totalCount: Int) -> SexySourceLayer {
+        guard totalCount > 1 else { return .贴近 }
+        let normalized = Double(index) / Double(totalCount - 1)
+        switch normalized {
+        case ..<0.20: return .克制
+        case ..<0.40: return .轻柔
+        case ..<0.60: return .贴近
+        case ..<0.80: return .投入
+        default: return .炽热
+        }
+    }
+
+    private func sexyImpactBoost(for normalizedMagnitude: Double) -> Int {
+        switch normalizedMagnitude {
+        case ..<0.32:
+            return -1
+        case ..<0.78:
+            return 0
+        case ..<0.93:
+            return 1
+        default:
+            return 2
+        }
+    }
+
+    private func sexyWindowBias(
+        normalizedMagnitude: Double,
+        sexyMomentum: Double,
+        impactBoost: Int
+    ) -> Double {
+        if normalizedMagnitude >= 0.90 {
+            return min(1.0, 0.84 + (normalizedMagnitude - 0.90) * 1.6)
+        }
+
+        if impactBoost < 0 {
+            return max(0.10, 0.18 + sexyMomentum * 0.18)
+        }
+
+        if impactBoost == 0 {
+            return min(0.62, 0.22 + sexyMomentum * 0.24 + normalizedMagnitude * 0.10)
+        }
+
+        return min(0.82, 0.48 + sexyMomentum * 0.18 + normalizedMagnitude * 0.14)
+    }
+
+    private func sexyWindowedShortlist(
+        from candidates: [DerivedClipVariant],
+        bias: Double
+    ) -> [DerivedClipVariant] {
+        let ordered = candidates.sorted { ($0.sourceOrderedIndex ?? 0) < ($1.sourceOrderedIndex ?? 0) }
+        guard ordered.count > 5 else { return ordered }
+
+        let anchor = Int(round(bias * Double(max(ordered.count - 1, 1))))
+        let radius = min(2, max(1, ordered.count / 7))
+        let start = max(0, anchor - radius)
+        let end = min(ordered.count - 1, anchor + radius)
+        return Array(ordered[start...end])
+    }
+
+    private func nearestSexyLayerCandidates(
+        from candidates: [DerivedClipVariant],
+        targetLayer: SexySourceLayer
+    ) -> [DerivedClipVariant] {
+        for distance in 1...4 {
+            let lower = SexySourceLayer(rawValue: targetLayer.rawValue - distance)
+            let upper = SexySourceLayer(rawValue: targetLayer.rawValue + distance)
+            let match = candidates.filter { candidate in
+                candidate.sexyLayer == lower || candidate.sexyLayer == upper
+            }
+            if !match.isEmpty {
+                return match
+            }
+        }
+        return candidates
     }
 
     private func effectiveTier(for mode: SoundMode, baseTier: IntensityTier, sexyMomentum: Double) -> IntensityTier {
@@ -1034,39 +1450,43 @@ final class SoundModeManager: ObservableObject {
         return weighted
     }
 
-    private func applyEQ(
+    private func eqSettings(
         for mode: SoundMode,
         tier: IntensityTier,
         normalizedMagnitude: Double,
         profile: VariantRenderProfile,
         sexyMomentum: Double = 0
-    ) {
-        let band = eq.bands[0]
+    ) -> PlaybackEQSettings {
+        let frequency: Float
+        let gain: Float
         switch mode {
         case .性感:
-            band.frequency = 900 + Float(normalizedMagnitude) * 520 + profile.eqFrequencyOffset + Float(sexyMomentum) * 140
-            band.gain = 0.2 + Float(normalizedMagnitude) * 1.4 + profile.eqGainOffset + Float(sexyMomentum) * 0.9
+            frequency = 900 + Float(normalizedMagnitude) * 520 + profile.eqFrequencyOffset + Float(sexyMomentum) * 140
+            gain = 0.2 + Float(normalizedMagnitude) * 1.4 + profile.eqGainOffset + Float(sexyMomentum) * 0.9
         case .经典:
-            band.frequency = 1_450 + Float(normalizedMagnitude) * 220 + profile.eqFrequencyOffset
-            band.gain = Float(normalizedMagnitude) * 0.45 + profile.eqGainOffset
+            frequency = 1_450 + Float(normalizedMagnitude) * 220 + profile.eqFrequencyOffset
+            gain = Float(normalizedMagnitude) * 0.45 + profile.eqGainOffset
         case .动物:
-            band.frequency = 1_700 + Float(normalizedMagnitude) * 1_420 + profile.eqFrequencyOffset
-            band.gain = 1.1 + Float(normalizedMagnitude) * 2.5 + profile.eqGainOffset
+            frequency = 1_700 + Float(normalizedMagnitude) * 1_420 + profile.eqFrequencyOffset
+            gain = 1.1 + Float(normalizedMagnitude) * 2.5 + profile.eqGainOffset
         case .惊喜:
-            band.frequency = 2_400 + Float(normalizedMagnitude) * 2_200 + profile.eqFrequencyOffset
-            band.gain = 2.8 + Float(normalizedMagnitude) * 3.8 + profile.eqGainOffset
+            frequency = 2_400 + Float(normalizedMagnitude) * 2_200 + profile.eqFrequencyOffset
+            gain = 2.8 + Float(normalizedMagnitude) * 3.8 + profile.eqGainOffset
         }
 
+        let bandwidth: Float
         switch mode {
         case .性感:
-            band.bandwidth = tier == .重 ? max(0.95, 1.15 - Float(sexyMomentum) * 0.18) : max(1.10, 1.35 - Float(sexyMomentum) * 0.12)
+            bandwidth = tier == .重 ? max(0.95, 1.15 - Float(sexyMomentum) * 0.18) : max(1.10, 1.35 - Float(sexyMomentum) * 0.12)
         case .经典:
-            band.bandwidth = 1.25
+            bandwidth = 1.25
         case .动物:
-            band.bandwidth = tier == .轻 ? 1.15 : 0.92
+            bandwidth = tier == .轻 ? 1.15 : 0.92
         case .惊喜:
-            band.bandwidth = tier == .重 ? 0.72 : 0.95
+            bandwidth = tier == .重 ? 0.72 : 0.95
         }
+
+        return PlaybackEQSettings(frequency: frequency, gain: gain, bandwidth: bandwidth)
     }
 
     private func buildLibraryStatus(totalRawCount: Int) -> String {
@@ -1083,13 +1503,44 @@ final class SoundModeManager: ObservableObject {
 
     private func refreshSexyLibraryLayerSummary() {
         let sexyVariants = playbackPools[.性感]?.allVariants ?? []
-        let uniqueMoods = Dictionary(grouping: sexyVariants, by: \.id).compactMap { $0.value.first }
+        let uniqueSources = Dictionary(grouping: sexyVariants, by: \.sourceName).compactMap { $0.value.first }
+        let counts = SexySourceLayer.allCases.map { layer in
+            "\(layer.displayName)\(uniqueSources.filter { $0.sexyLayer == layer }.count)"
+        }
+        sexyLibraryLayerSummary = counts.joined(separator: " / ")
+    }
 
-        let gentle = uniqueMoods.filter { $0.sourceMood < 0.25 }.count
-        let warm = uniqueMoods.filter { $0.sourceMood >= 0.25 && $0.sourceMood < 0.60 }.count
-        let hot = uniqueMoods.filter { $0.sourceMood >= 0.60 }.count
+    private func sexyWindowLabel(for candidates: [DerivedClipVariant]) -> String {
+        let ordered = candidates.compactMap(\.sourceOrderedIndex).sorted()
+        guard let first = ordered.first, let last = ordered.last else { return "-" }
+        if first == last {
+            return String(format: "%02d", first)
+        }
+        return String(format: "%02d-%02d", first, last)
+    }
 
-        sexyLibraryLayerSummary = "轻柔\(gentle) / 贴近\(warm) / 炽热\(hot)"
+    private func orderedIndex(from sourceName: String, mode: SoundMode) -> Int? {
+        let lowered = sourceName.lowercased()
+        let english: String
+        switch mode {
+        case .性感: english = "sexy"
+        case .经典: english = "classic"
+        case .动物: english = "animal"
+        case .惊喜: english = "surprise"
+        }
+        guard lowered.contains("audio_\(english)") ||
+                lowered.contains("audio-\(english)") ||
+                lowered.contains("audio\(english)") ||
+                lowered.contains(mode.rawValue.lowercased()) ||
+                lowered.contains(english) else {
+            return nil
+        }
+
+        let digitGroups = lowered
+            .components(separatedBy: CharacterSet.decimalDigits.inverted)
+            .filter { !$0.isEmpty }
+        guard let last = digitGroups.last, let value = Int(last) else { return nil }
+        return value
     }
 
     private func variantID(for sourceURL: URL?, tier: IntensityTier) -> String {
@@ -1247,12 +1698,12 @@ final class SoundModeManager: ObservableObject {
         let cadenceBonus: Double
         if lastSexyHitTime > 0 {
             let interval = now - lastSexyHitTime
-            cadenceBonus = max(0, (1.8 - min(interval, 1.8)) / 1.8) * 0.20
+            cadenceBonus = max(0, (1.2 - min(interval, 1.2)) / 1.2) * 0.18
         } else {
             cadenceBonus = 0
         }
 
-        let impulse = 0.18 + normalizedMagnitude * 0.34 + cadenceBonus
+        let impulse = 0.05 + normalizedMagnitude * 0.18 + cadenceBonus * 0.85
         sexyMomentum = min(1.0, decayed + impulse)
         lastSexyMomentumUpdate = now
         lastSexyHitTime = now
@@ -1268,6 +1719,9 @@ final class SoundModeManager: ObservableObject {
 
     private func decayedSexyMomentum(at now: TimeInterval) -> Double {
         guard lastSexyMomentumUpdate > 0 else { return sexyMomentum }
+        if lastSexyHitTime > 0, now - lastSexyHitTime >= sexyIdleResetAfter {
+            return 0
+        }
         let elapsed = max(0, now - lastSexyMomentumUpdate)
         guard sexyMomentum > 0 else { return 0 }
         let decay = pow(0.5, elapsed / sexyDecayHalfLife)
@@ -1277,11 +1731,11 @@ final class SoundModeManager: ObservableObject {
     private func publishSexyState() {
         sexyStateValue = sexyMomentum
         switch sexyMomentum {
-        case ..<0.18:
+        case ..<0.30:
             sexyStateLabel = "冷静"
-        case ..<0.42:
+        case ..<0.56:
             sexyStateLabel = "升温"
-        case ..<0.72:
+        case ..<0.78:
             sexyStateLabel = "投入"
         default:
             sexyStateLabel = "炽热"

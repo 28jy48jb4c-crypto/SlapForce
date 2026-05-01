@@ -124,11 +124,6 @@ final class HIDAccelerometerService {
         sampleCount += 1
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if self.sampleCount % 60 == 0 {
-                self.onStatus?(
-                    "AppleSPU samples: \(self.sampleCount), raw \(self.lastRaw.x), \(self.lastRaw.y), \(self.lastRaw.z), magnitude \(String(format: "%.3f", sample.magnitude))"
-                )
-            }
             self.onSample?(sample)
         }
     }

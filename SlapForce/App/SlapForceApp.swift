@@ -25,7 +25,7 @@ struct SlapForceApp: App {
                 .environmentObject(soundModeManager)
                 .environmentObject(monitor)
                 .environmentObject(power)
-                .frame(minWidth: 680, minHeight: 520)
+                .frame(minWidth: 620, minHeight: 430)
                 .onAppear {
                     monitor.configure(settings: settings, soundModeManager: soundModeManager)
                 }
