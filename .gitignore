@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+
+# Build outputs and caches
+build/
+DerivedData/
+.build/
+.swift-module-cache/
+
+# Swift / clang module caches
+ModuleCache/
+
+# Editor / local tooling
+.idea/
+.vscode/
