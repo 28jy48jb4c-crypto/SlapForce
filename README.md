@@ -181,6 +181,7 @@ cd "/Users/84471753qq.com/Documents/Codex/mac 声音拍打管理器/SlapForce"
 Additional resume notes:
 
 - `docs/CONTINUE_WITH_CODEX.md`
+- `docs/RELEASE.md`
 
 ## Git Workflow
 
@@ -219,3 +220,9 @@ The repository already contains:
 - restore and sync scripts
 - repository-backed sound seeds
 - the first large `性感` mode ordered sound set snapshot
+
+## Release Notes
+
+For release cleanup, signing, packaging, and notarization guidance specific to the current project state, see:
+
+- `docs/RELEASE.md`
